@@ -3,6 +3,7 @@
 package xla_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -12,7 +13,6 @@ import (
 	"github.com/gomlx/compute/support/backendtest"
 	"github.com/gomlx/compute/support/testutil"
 	"github.com/gomlx/go-xla/compute/xla"
-	"github.com/stretchr/testify/assert"
 	"k8s.io/klog/v2"
 )
 
@@ -59,8 +59,12 @@ func TestCompileAndRun(t *testing.T) {
 		y0, err := testutil.Exec1(backend, nil, func(f compute.Function, params []compute.Value) (compute.Value, error) {
 			return f.Constant([]float32{-7})
 		})
-		assert.NoError(t, err)
-		assert.Equal(t, float32(-7), y0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got, want := y0, float32(-7); got != want {
+			t.Errorf("got %v, want %v", got, want)
+		}
 	})
 }
 
@@ -76,12 +80,53 @@ func TestCompliance(t *testing.T) {
 	})
 }
 
+func benchAllPlugins(b *testing.B, fn func(b *testing.B, backend compute.Backend, plugin string)) {
+	envBackend := os.Getenv(compute.ConfigEnvVar)
+	if envBackend != "" {
+		backend, err := compute.New()
+		if err != nil {
+			b.Fatalf("Failed to create backend %q: %v", envBackend, err)
+		}
+		defer backend.Finalize()
+		xlaBackend := backend.(*xla.Backend)
+		fn(b, backend, xlaBackend.PluginName())
+		return
+	}
+
+	plugins := []string{"cpu", "cuda", "tpu"}
+	for _, plugin := range plugins {
+		b.Run(plugin, func(b *testing.B) {
+			backendName := fmt.Sprintf("%s:%s", xla.BackendName, plugin)
+			if err := os.Setenv(compute.ConfigEnvVar, backendName); err != nil {
+				b.Fatalf("Failed to set env %s=%s", compute.ConfigEnvVar, backendName)
+			}
+			defer os.Unsetenv(compute.ConfigEnvVar)
+
+			backend, err := compute.New()
+			if err != nil {
+				b.Skipf("Plugin %q not available: %v", plugin, err)
+				return
+			}
+			defer backend.Finalize()
+			fn(b, backend, plugin)
+		})
+	}
+}
+
+func BenchmarkCompliance(b *testing.B) {
+	benchAllPlugins(b, func(b *testing.B, backend compute.Backend, plugin string) {
+		backendtest.RunAllBenchmarks(b, backend)
+	})
+}
+
 func TestNewWithOptions(t *testing.T) {
 	// Test cpu backend default hasSharedBuffers behavior
 	backend, err := xla.NewWithOptions("cpu", nil)
 	if err == nil {
 		defer backend.Finalize()
-		assert.True(t, backend.HasSharedBuffers())
+		if !backend.HasSharedBuffers() {
+			t.Errorf("expected HasSharedBuffers to be true")
+		}
 	} else {
 		t.Logf("cpu plugin not available, skipping test: %v", err)
 	}
@@ -90,65 +135,140 @@ func TestNewWithOptions(t *testing.T) {
 	backend, err = xla.NewWithOptions("cpu,shared_buffers=false", nil)
 	if err == nil {
 		defer backend.Finalize()
-		assert.False(t, backend.HasSharedBuffers())
+		if backend.HasSharedBuffers() {
+			t.Errorf("expected HasSharedBuffers to be false")
+		}
 	}
 
 	// Test cpu with shared_buffers=0
 	backend, err = xla.NewWithOptions("cpu,shared_buffers=0", nil)
 	if err == nil {
 		defer backend.Finalize()
-		assert.False(t, backend.HasSharedBuffers())
+		if backend.HasSharedBuffers() {
+			t.Errorf("expected HasSharedBuffers to be false")
+		}
 	}
 
 	// Test cpu with shared_buffers=true
 	backend, err = xla.NewWithOptions("cpu,shared_buffers=true", nil)
 	if err == nil {
 		defer backend.Finalize()
-		assert.True(t, backend.HasSharedBuffers())
+		if !backend.HasSharedBuffers() {
+			t.Errorf("expected HasSharedBuffers to be true")
+		}
 	}
 
 	// Test cpu with shared_buffers (no value, should default to true)
 	backend, err = xla.NewWithOptions("cpu,shared_buffers", nil)
 	if err == nil {
 		defer backend.Finalize()
-		assert.True(t, backend.HasSharedBuffers())
+		if !backend.HasSharedBuffers() {
+			t.Errorf("expected HasSharedBuffers to be true")
+		}
 	}
 
 	// Test cpu with noshared_buffers
 	backend, err = xla.NewWithOptions("cpu,noshared_buffers", nil)
 	if err == nil {
 		defer backend.Finalize()
-		assert.False(t, backend.HasSharedBuffers())
+		if backend.HasSharedBuffers() {
+			t.Errorf("expected HasSharedBuffers to be false")
+		}
 	}
 
 	// Test cpu with notf32
 	backend, err = xla.NewWithOptions("cpu,notf32", nil)
 	if err == nil {
 		defer backend.Finalize()
-		assert.False(t, backend.DotGeneralUseTF32)
+		if backend.DotGeneralUseTF32 {
+			t.Errorf("expected DotGeneralUseTF32 to be false")
+		}
 	}
 
 	// Test cpu with tf32=false
 	backend, err = xla.NewWithOptions("cpu,tf32=false", nil)
 	if err == nil {
 		defer backend.Finalize()
-		assert.False(t, backend.DotGeneralUseTF32)
+		if backend.DotGeneralUseTF32 {
+			t.Errorf("expected DotGeneralUseTF32 to be false")
+		}
 	}
 
 	// Test cpu with tf32 (no value, should default to true)
 	backend, err = xla.NewWithOptions("cpu,tf32", nil)
 	if err == nil {
 		defer backend.Finalize()
-		assert.True(t, backend.DotGeneralUseTF32)
+		if !backend.DotGeneralUseTF32 {
+			t.Errorf("expected DotGeneralUseTF32 to be true")
+		}
 	}
 
 	// Test help requested via pluginName
 	_, err = xla.NewWithOptions("help", nil)
-	assert.Error(t, err)
-	assert.Equal(t, "Help requested", err.Error())
+	if err == nil {
+		t.Errorf("expected error for help")
+	} else if err.Error() != "Help requested" {
+		t.Errorf("expected %q, got %q", "Help requested", err.Error())
+	}
 
 	// Test help requested via option
 	_, err = xla.NewWithOptions("cpu,help", nil)
-	assert.Error(t, err)
-	assert.Equal(t, "Help requested", err.Error())
+	if err == nil {
+		t.Errorf("expected error for cpu,help")
+	} else if err.Error() != "Help requested" {
+		t.Errorf("expected %q, got %q", "Help requested", err.Error())
+	}
+}
+
+type mockInstaller struct {
+	calledAutoInstall       bool
+	calledAutoInstallPlugin string
+}
+
+func (m *mockInstaller) AutoInstall() error {
+	m.calledAutoInstall = true
+	return nil
+}
+
+func (m *mockInstaller) AutoInstallPlugin(pluginName string) error {
+	m.calledAutoInstallPlugin = pluginName
+	return nil
+}
+
+func TestAutoInstall(t *testing.T) {
+	// 1. When not registered:
+	err := xla.AutoInstall()
+	if err == nil {
+		t.Fatal("expected error when auto-installer is not registered")
+	}
+	if !errors.Is(err, xla.ErrNoAutoInstaller) {
+		t.Fatalf("expected ErrNoAutoInstaller, got: %v", err)
+	}
+
+	err = xla.AutoInstallPlugin("cuda")
+	if err == nil {
+		t.Fatal("expected error when auto-installer is not registered")
+	}
+	if !errors.Is(err, xla.ErrNoAutoInstaller) {
+		t.Fatalf("expected ErrNoAutoInstaller, got: %v", err)
+	}
+
+	// 2. When registered:
+	mock := &mockInstaller{}
+	xla.RegisterAutoInstaller(mock)
+	defer xla.RegisterAutoInstaller(nil)
+
+	if err := xla.AutoInstall(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !mock.calledAutoInstall {
+		t.Errorf("expected AutoInstall to be called on mock")
+	}
+
+	if err := xla.AutoInstallPlugin("cuda"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.calledAutoInstallPlugin != "cuda" {
+		t.Errorf("expected AutoInstallPlugin to be called with 'cuda', got %q", mock.calledAutoInstallPlugin)
+	}
 }
